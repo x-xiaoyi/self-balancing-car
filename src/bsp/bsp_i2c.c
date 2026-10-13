@@ -1,90 +1,119 @@
 #include "bsp/bsp_i2c.h"
 
-static I2C_HandleTypeDef hi2c1;
+I2C_HandleTypeDef hi2c1;
 
-/* 解锁失败时记录是哪条线被拉低: bit0=SCL, bit1=SDA (1=低电平) */
-static uint8_t i2c_bus_low_lines = 0U;
+/* 解锁时记录到的"被拉低的线"：bit0 = SCL 低，bit1 = SDA 低。
+ * 主程序用 BspI2c_GetBusLowLines() 读它来定位病因（见笔记里的排查手册）。 */
+static uint8_t s_bus_low_mask = 0U;
 
-/* bit-bang 总线时的粗略延时(约十微秒量级),只求把时钟拉慢,不要求精确 */
-static void BspI2c_Delay(void)
-{
-    for (volatile uint32_t i = 0U; i < 300U; i++)
-    {
-    }
-}
+/* ---------- PB6/PB7 的两种身份 ---------- */
 
-/* 总线解锁:从机若卡在传输中途,会一直拉低 SDA 不放;
-   用 9 个时钟脉冲把它"喂饱",再补一个 STOP 让总线回到空闲 */
-static HAL_StatusTypeDef BspI2c_BusUnlock(void)
+/* 正常通信：I2C1 复用开漏（电平由 I2C 外设驱动） */
+static void i2c_pins_af(void)
 {
     GPIO_InitTypeDef gpio = {0};
-
-    __HAL_RCC_GPIOB_CLK_ENABLE();
-
-    /* 先把两条线置高,避免切换模式的瞬间把总线拉低 */
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6 | GPIO_PIN_7, GPIO_PIN_SET);
-
-    /* 暂时把 SCL(PB6)/SDA(PB7) 当普通开漏输出用,由软件手动拨总线 */
-    gpio.Pin = GPIO_PIN_6 | GPIO_PIN_7;
-    gpio.Mode = GPIO_MODE_OUTPUT_OD;
-    gpio.Pull = GPIO_PULLUP;
+    gpio.Pin   = GPIO_PIN_6 | GPIO_PIN_7;
+    gpio.Mode  = GPIO_MODE_AF_OD;
+    gpio.Pull  = GPIO_NOPULL;
     gpio.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(GPIOB, &gpio);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6 | GPIO_PIN_7, GPIO_PIN_SET);
-    BspI2c_Delay();
+}
 
-    /* SCL 被拉低就无法产生时钟脉冲,软件救不了;先记录再退出 */
+/* 解锁用：降级成普通开漏输出，让软件可以手动拨总线。
+ * 开漏 = 只能主动拉低、或"松手"；线要变高只能靠上拉电阻。 */
+static void i2c_pins_gpio(void)
+{
+    GPIO_InitTypeDef gpio = {0};
+    gpio.Pin   = GPIO_PIN_6 | GPIO_PIN_7;
+    gpio.Mode  = GPIO_MODE_OUTPUT_OD;
+    gpio.Pull  = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOB, &gpio);
+
+    /* 写 1 = 高阻 = 松手 */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6 | GPIO_PIN_7, GPIO_PIN_SET);
+}
+
+/* 半周期忙等。I2C 要求高低电平各不少于约 1.3us，
+ * 用忙等而不是 HAL_Delay(1)（1ms 也能用，但这里没必要那么慢）。 */
+static void i2c_delay(void)
+{
+    for (volatile uint32_t d = 0U; d < 2000U; d++)
+    {
+    }
+}
+
+/* ---------- 总线解锁：9 个 SCL 脉冲 + STOP ---------- */
+
+/* 为什么是 9 个脉冲：一个字节 8 位 + 1 个 ACK 位。
+ * 从机是被 SCL 推着走的状态机、没有超时机制，只有把"剩下的位"喂完它才会松手。
+ * 返回 HAL_OK 表示总线已松开。 */
+static HAL_StatusTypeDef BspI2c_BusUnlock(void)
+{
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    /* 1) 降级为普通 GPIO 并松手，然后读回真实电平 */
+    i2c_pins_gpio();
+    i2c_delay();
+
+    s_bus_low_mask = 0U;
     if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_6) == GPIO_PIN_RESET)
     {
-        i2c_bus_low_lines = 1U;
-        return HAL_ERROR;
+        s_bus_low_mask |= 0x01U;    /* SCL 低 */
     }
-
-    /* 9 个 SCL 脉冲:让卡住的从机把剩余数据位发完,从而松开 SDA */
-    for (uint8_t i = 0U; i < 9U; i++)
-    {
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
-        BspI2c_Delay();
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
-        BspI2c_Delay();
-    }
-
-    /* 补一个 STOP:SCL 保持高电平,让 SDA 由低跳高,通知总线"本轮结束" */
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET);
-    BspI2c_Delay();
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);
-    BspI2c_Delay();
-
-    /* 脉冲补完后 SDA 仍是低 → 不是从机卡住,是线路上有硬故障 */
     if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_7) == GPIO_PIN_RESET)
     {
-        i2c_bus_low_lines = 2U;
+        s_bus_low_mask |= 0x02U;    /* SDA 低 */
+    }
+
+    /* 2) SCL 被拽住 → 根本产生不了时钟，软件救不了，直接判硬故障 */
+    if ((s_bus_low_mask & 0x01U) != 0U)
+    {
+        i2c_pins_af();
         return HAL_ERROR;
     }
 
-    i2c_bus_low_lines = 0U;
-    return HAL_OK;
+    /* 3) SDA 被拽住 → 这才是"从机卡死"的解药：发 9 个 SCL 脉冲 */
+    if ((s_bus_low_mask & 0x02U) != 0U)
+    {
+        for (uint8_t i = 0U; i < 9U; i++)
+        {
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
+            i2c_delay();
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
+            i2c_delay();
+        }
+
+        /* 4) 补一个 STOP：SCL 保持高，SDA 由低跳高，把总线状态机彻底复位 */
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET);
+        i2c_delay();
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);
+        i2c_delay();
+    }
+
+    /* 5) 恢复成 I2C 复用开漏，再复查 SDA 是否真的松开 */
+    i2c_pins_af();
+    i2c_delay();
+
+    return (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_7) == GPIO_PIN_SET) ? HAL_OK : HAL_ERROR;
 }
 
-/* 诊断用:返回解锁失败时被拉低的线,bit0=SCL,bit1=SDA,返回 0 表示都正常 */
 uint8_t BspI2c_GetBusLowLines(void)
 {
-    return i2c_bus_low_lines;
+    return s_bus_low_mask;
 }
+
+/* ---------- 对外接口 ---------- */
 
 HAL_StatusTypeDef BspI2c_Init(void)
 {
-    /* 先解锁总线(专治从机卡死拉低 SDA),再配置外设 */
-    if (BspI2c_BusUnlock() != HAL_OK)
-    {
-        return HAL_BUSY;
-    }
+    /* 先解锁，再初始化外设。
+     * 顺序不能反：万一从机还卡在"拽住 SDA"，一上来就 HAL_I2C_Init，
+     * 后面第一次通信必然 HAL_BUSY（等 BUSY 清零等满 25ms 认输）。 */
+    (void)BspI2c_BusUnlock();
 
     hi2c1.Instance = I2C1;
-
-    /* 100kHz 是在 project1 上跑通过的配置(OLED 和 MPU6050 共用这条总线)。
-     * 想提速可以改 400000(OLED 全屏刷 1024 字节约 92ms → 23ms),但一次只改一个变量:
-     * 先确认 100kHz 稳定,再动这个数。 */
     hi2c1.Init.ClockSpeed = 100000;
     hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
     hi2c1.Init.OwnAddress1 = 0;
@@ -96,38 +125,22 @@ HAL_StatusTypeDef BspI2c_Init(void)
     return HAL_I2C_Init(&hi2c1);
 }
 
-/* 名字必须是 HAL_I2C_MspInit(I2C 全大写):HAL_I2C_Init 内部按这个名字去找弱符号,
- * 写成 HAL_I2c_MspInit 就变成另一个函数,HAL 找不到 → 走空的默认实现 → 时钟没开、
- * 引脚没配,静默失败 */
 void HAL_I2C_MspInit(I2C_HandleTypeDef *hi2c)
 {
     if (hi2c->Instance == I2C1)
     {
         __HAL_RCC_GPIOB_CLK_ENABLE();
         __HAL_RCC_I2C1_CLK_ENABLE();
-
-        GPIO_InitTypeDef GPIO_InitStruct = {0};
-        GPIO_InitStruct.Pin = GPIO_PIN_6 | GPIO_PIN_7;
-        GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;     /* I2C 是开漏总线,必须 OD 不是 PP */
-        GPIO_InitStruct.Pull = GPIO_PULLUP;
-        GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-        HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+        i2c_pins_af();
     }
 }
 
-HAL_StatusTypeDef BspI2c_Probe(uint8_t address, uint32_t trials, uint32_t timeout)
+HAL_StatusTypeDef BspI2c_Read(uint8_t address,uint8_t reg,uint8_t *data,uint16_t length,uint32_t timeout)
 {
-    return HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(address << 1U), trials, timeout);
+    return HAL_I2C_Mem_Read(&hi2c1,(uint16_t)(address<<1U),(uint16_t)reg,I2C_MEMADD_SIZE_8BIT,data,length,timeout);
 }
 
-HAL_StatusTypeDef BspI2c_Read(uint8_t address, uint8_t reg, uint8_t *data, uint16_t length, uint32_t timeout)
+HAL_StatusTypeDef BspI2c_Write(uint8_t address,uint8_t reg,uint8_t *data,uint16_t length,uint32_t timeout)
 {
-    return HAL_I2C_Mem_Read(&hi2c1, (uint16_t)(address << 1U), (uint16_t)reg,
-                            I2C_MEMADD_SIZE_8BIT, data, length, timeout);
-}
-
-HAL_StatusTypeDef BspI2c_Write(uint8_t address, uint8_t reg, uint8_t *data, uint16_t length, uint32_t timeout)
-{
-    return HAL_I2C_Mem_Write(&hi2c1, (uint16_t)(address << 1U), (uint16_t)reg,
-                             I2C_MEMADD_SIZE_8BIT, data, length, timeout);
+    return HAL_I2C_Mem_Write(&hi2c1,(uint16_t)(address<<1U),(uint16_t)reg,I2C_MEMADD_SIZE_8BIT,data,length,timeout);
 }
