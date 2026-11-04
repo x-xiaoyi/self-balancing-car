@@ -5,6 +5,8 @@
 #include "bsp/bsp_mpu.h"
 #include "motor/motor.h"
 #include "algorithm/attitude.h"
+#include "algorithm/pid.h"
+#include "control/balance.h"
 #include "error/error_handle.h"
 
 #include <stdio.h>
@@ -85,45 +87,81 @@ int main(void)
     }
     Attitude_Init(&init_d);
 
-    Attitude_t att = {0};
-    uint32_t last_tick  = HAL_GetTick();
-    uint32_t sample_cnt = 0U;
+    /* 控制环初始化：只准备 PID 和状态机，不会动电机，也不会启动定时器 */
+    init_report("bal", Balance_Init());
 
-    /* 主循环：读一帧 → 融合 → 打印一帧。
-     * 100ms 一帧（10Hz）只是为了肉眼观察；平衡车真正跑控制时，
-     * 这里要换成定时器节拍，不能靠 HAL_Delay 硬拖。 */
+    /* ---------- 把人肉需要核对的东西先摊在串口上 ---------- */
+    /* 符号和量级是"上电前"必须确认的两件事：
+     * 符号错 → 车会追着自己的倒向加速（正反馈）；量级错 → 一歪就满占空比。
+     * 所以下面这几行不是装饰，是 DRY_RUN 阶段的对照表。 */
+#if (CAR_DRY_RUN != 0)
+    printf("[mode] CAR_DRY_RUN=1  只计算不输出（电机不会动）\r\n");
+    printf("[mode] 核对方法：手扶车体前倾/后仰，看 P 的正负是否与倾倒方向相反\r\n");
+#else
+    printf("[mode] CAR_DRY_RUN=0  真实驱动电机！先把车架空再上电\r\n");
+#endif
+    printf("[pid ] 直立: Kp=%.2f Ki=%.2f Kd=%.2f -> ±%.0f\r\n",
+           (double)BAL_ANGLE_KP, (double)BAL_ANGLE_KI, (double)BAL_ANGLE_KD, (double)BAL_MAX_DUTY);
+    printf("[pid ] 转向: Kp=%.2f 目标 %.1f deg/s 限幅 ±%.0f\r\n",
+           (double)BAL_STEER_KP, (double)BAL_STEER_TARGET_DPS, (double)BAL_STEER_LIMIT);
+    printf("[safe] 倾倒锁存 %.0f deg / 起控 %.0f deg / 软启动 %u ms / IMU 连失 %u 拍\r\n",
+           (double)BAL_TILT_LIMIT_DEG, (double)BAL_UPRIGHT_ARM_DEG,
+           (unsigned)BAL_SOFT_START_MS, (unsigned)BAL_IMU_FAIL_LIMIT);
+
+    /* ---------- 起控制节拍 ----------
+     * ⚠️ 从这一行开始，MPU6050 与 I2C1 就被 200Hz 的中断独占了。
+     *    主循环里再出现 BspMpu_GetData / Attitude_Update 就是两条线抢一条 I2C：
+     *    中断做 14 字节突发读做到一半，主循环插进去发 START，两边都会拿到错数据，
+     *    而且症状是"偶发角度跳变"，极难查。主循环只许读 Balance_GetTelemetry 的快照。 */
+    init_report("tick", Balance_StartControl());
+
+    printf("[run ] 200Hz 控制节拍已启动，下面 10Hz 打印遥测\r\n\r\n");
+
+    uint32_t last_print = HAL_GetTick();
+
     while (1)
     {
-        MpuData_t d = {0};
+        uint32_t now = HAL_GetTick();
 
-        if (BspMpu_GetData(&d) == HAL_OK)
+        /* 主循环只做低频遥测 + 状态机的外围（打印故障、给人看）。
+         * 100ms 一帧是给人眼看的；控制全在中断里，主循环慢一点不影响控制周期。 */
+        if ((now - last_print) >= 100U)
         {
-            uint32_t now = HAL_GetTick();
-            sample_cnt++;
+            BalanceTelemetry_t t = {0};
+            last_print = now;
 
-            /* 第一帧没有"上一帧"，dt 无从谈起 → 直接丢弃：不融合、不打印。
-             * 从第 2 帧起 dt 才是真实间隔，这样也就不需要再编一个假的占位值。 */
-            if (sample_cnt >= 2U)
+            /* 故障事件"取走即清"，所以这里只会打印一次 —— 中断里不能 printf，
+             * 故障原因必须由主循环替它说出来。 */
+            uint8_t fault = Balance_TakeFaultEvent();
+            if (fault != BAL_FAULT_NONE)
             {
-                float dt_s = (float)(now - last_tick) / 1000.0f;   /* ms → s，量纲才配得上 °/s */
-
-                Attitude_Update(&d, dt_s, &att);
-
-                printf("A %6.3f %6.3f %6.3f | G %7.2f %7.2f %7.2f | T%5.2f | R%7.2f P%7.2f | DT%4.0f\r\n",
-                       d.accel[0], d.accel[1], d.accel[2],
-                       d.gyro[0],  d.gyro[1],  d.gyro[2],
-                       d.temp,
-                       att.roll_reg, att.pitch_reg,
-                       dt_s * 1000.0f);
+                printf("[fault] %s → 输出已锁死（0 占空比），必须断电重启才恢复\r\n",
+                       Balance_FaultName(fault));
             }
 
-            last_tick = now;
-        }
-        else
-        {
-            printf("[loop] mpu read FAIL\r\n");
+            if (Balance_GetTelemetry(&t) != 0U)
+            {
+                /* 列意：P=pitch(度) GY=pitch 角速度 YR=yaw 角速度
+                 *       A=直立环输出 S=转向环输出 L/R=最终占空比(带符号)
+                 *       RMP=软启动进度 N=控制拍数 OV=丢拍数 IMU=I2C 失败次数 */
+                printf("[ctl] %-5s P%7.2f GY%8.2f YR%8.2f | A%7.1f S%7.1f | L%6d R%6d | RMP%3u | N%lu OV%lu IMU%lu\r\n",
+                       Balance_StateName(t.state),
+                       (double)t.pitch_deg, (double)t.pitch_rate_dps, (double)t.yaw_rate_dps,
+                       (double)t.angle_out, (double)t.steer_out,
+                       (int)t.duty_left, (int)t.duty_right,
+                       (unsigned)t.ramp_pct,
+                       (unsigned long)t.cycle_count,
+                       (unsigned long)t.overrun_count,
+                       (unsigned long)t.imu_fail_count);
+            }
+            else
+            {
+                printf("[ctl] telemetry not ready\r\n");
+            }
         }
 
-        HAL_Delay(100U);
+        /* 这一句只是让主循环别空转烧 CPU；它会被中断打断，不影响 5ms 节拍。
+         * 别在这里写长延时（比如 500ms）：故障打印的延迟会跟着变长。 */
+        HAL_Delay(10U);
     }
 }
